@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""准备或验证由公开精确提交构成的独立 SDK，不修改其他 SDK。"""
+"""只准备或校验组件锁定的单一正式 SDK 派生；check 不下载或执行 SDK 脚本。"""
 from __future__ import annotations
 
 import argparse
 import hashlib
-import stat
 import json
 import os
-from pathlib import Path
+import stat
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
-import tempfile
 import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 LOCK_PATH = Path(__file__).resolve().parents[1] / "sdk-lock.json"
+DERIVATION_STAMP = "esp-sdk-derivation.json"
+RECIPE_REPOSITORY = "https://github.com/darren-you/esp-base.git"
 
 
 def git_environment() -> dict:
@@ -27,26 +32,22 @@ def git_environment() -> dict:
 
 
 def git(path: Path, *args: str) -> str:
-    result = subprocess.run(["git", "-C", str(path), *args], text=True, capture_output=True, env=git_environment())
-    if result.returncode:
-        raise RuntimeError(f"Git 失败：{' '.join(args)}\n{result.stderr.strip()}")
-    return result.stdout.strip()
+    return subprocess.run(
+        ["git", "-C", str(path), *args], check=True, capture_output=True, text=True, env=git_environment()
+    ).stdout.rstrip("\n")
 
 
-def read_lock() -> dict:
-    lock = json.loads(LOCK_PATH.read_text())
-    if set(lock) != {"schema_version", "idf", "lwip"} or lock["schema_version"] != 1:
-        raise ValueError("不支持的 SDK 锁文件")
-    for name, fields in (("idf", {"repository", "revision"}),
-                         ("lwip", {"repository", "revision", "path"})):
-        entry = lock[name]
-        if set(entry) != fields or not re.fullmatch(r"[0-9a-f]{40}", entry["revision"]):
-            raise ValueError(f"{name} 必须锁定完整提交")
-        if not re.fullmatch(r"https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9-]+\.git", entry["repository"]):
-            raise ValueError(f"{name} 必须使用明确的公开 GitHub HTTPS 源")
-    if lock["lwip"]["path"] != "components/lwip/lwip":
-        raise ValueError("lwIP 装配位置与 ESP-IDF 合同不符")
-    return lock
+def git_boolean(path: Path, key: str) -> bool:
+    """按 Git 的作用域、include 与原生布尔规则读取最终有效值。"""
+    result = subprocess.run(
+        ["git", "-C", str(path), "config", "--bool", "--get", key],
+        text=True, capture_output=True, env=git_environment())
+    if result.returncode == 1:
+        return False
+    value = result.stdout.strip()
+    if result.returncode == 0 and value in ("true", "false"):
+        return value == "true"
+    raise ValueError(f"来源 Git 布尔配置无效：{key}：{path}\n{result.stderr.strip()}")
 
 
 def verify_object_bytes(path: Path) -> None:
@@ -91,7 +92,9 @@ def verify_object_bytes(path: Path) -> None:
             process.wait()
 
 
-def verify_tracked_tree(path: Path, source_root: Path, gitlink_overrides: dict, revision: str) -> None:
+def verify_tracked_tree(path: Path, source_root: Path, gitlink_overrides: dict, revision: str,
+                        capacity_files: dict | None = None, capacity_seen: set | None = None,
+                        capacity_patched: bool = False, capacity_stamp: str | None = None) -> None:
     """直接以 HEAD 的 Git blob 字节与类型核对源码，不读取 index 的内容提示。"""
     result = subprocess.run(["git", "-C", str(path), "ls-tree", "-r", "-z", revision],
                             check=True, capture_output=True, env=git_environment())
@@ -137,10 +140,16 @@ def verify_tracked_tree(path: Path, source_root: Path, gitlink_overrides: dict, 
             if git(file, "rev-parse", "HEAD") != expected:
                 raise ValueError(f"来源 gitlink 提交与锁定 HEAD 不符：{file}")
             verify_complete_repository(file, source_root=source_root,
-                                       gitlink_overrides=gitlink_overrides, revision=expected)
+                                       gitlink_overrides=gitlink_overrides, revision=expected,
+                                       capacity_files=capacity_files, capacity_seen=capacity_seen,
+                                       capacity_patched=capacity_patched, capacity_stamp=capacity_stamp)
             continue
         if kind != b"blob" or mode not in (b"100644", b"100755", b"120000"):
             raise ValueError(f"来源 HEAD 包含不支持的文件类型：{file}")
+        capacity_item = (capacity_files or {}).get(file.relative_to(source_root).as_posix())
+        if capacity_item and (mode != b"100644" or path.resolve() != (
+                source_root if capacity_item["repository"] == "idf" else source_root / "components/heap/tlsf")):
+            raise ValueError(f"SDK 容量原件必须属于正确仓库的普通非执行 blob：{file}")
         if mode == b"120000":
             if not stat.S_ISLNK(actual.st_mode):
                 raise ValueError(f"来源 tracked 符号链接类型与 HEAD 不符：{file}")
@@ -152,6 +161,7 @@ def verify_tracked_tree(path: Path, source_root: Path, gitlink_overrides: dict, 
                     or bool(actual.st_mode & stat.S_IXUSR) != (mode == b"100755")):
                 raise ValueError(f"来源 tracked 文件类型或执行位与 HEAD 不符：{file}")
             digest = hashlib.new(object_format, b"blob " + str(actual.st_size).encode() + b"\0")
+            capacity_digest = hashlib.sha256() if capacity_item else None
             descriptor = os.open(file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             with os.fdopen(descriptor, "rb") as stream:
                 opened = os.fstat(stream.fileno())
@@ -160,6 +170,8 @@ def verify_tracked_tree(path: Path, source_root: Path, gitlink_overrides: dict, 
                     raise ValueError(f"来源 tracked 文件在检查期间改变：{file}")
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
+                    if capacity_digest is not None:
+                        capacity_digest.update(chunk)
                 after = os.fstat(stream.fileno())
                 if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
                         opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
@@ -168,13 +180,24 @@ def verify_tracked_tree(path: Path, source_root: Path, gitlink_overrides: dict, 
             if (current.st_dev, current.st_ino, current.st_mode) != (
                     actual.st_dev, actual.st_ino, actual.st_mode):
                 raise ValueError(f"来源 tracked 文件在检查期间被替换：{file}")
-        if digest.hexdigest() != object_id.decode("ascii"):
+        if capacity_item:
+            original = subprocess.run(["git", "-C", str(path), "cat-file", "blob", object_id.decode("ascii")],
+                                      check=True, capture_output=True, env=git_environment()).stdout
+            if hashlib.sha256(original).hexdigest() != capacity_item["before_sha256"]:
+                raise ValueError(f"SDK 容量原件 HEAD blob 与 before 摘要不符：{file}")
+            expected = capacity_item["after_sha256"] if capacity_patched else capacity_item["before_sha256"]
+            if capacity_digest.hexdigest() != expected:
+                raise ValueError(f"SDK 容量原始字节与精确派生摘要不符：{file}")
+            capacity_seen.add(file.relative_to(source_root).as_posix())
+        if (not capacity_item or not capacity_patched) and digest.hexdigest() != object_id.decode("ascii"):
             raise ValueError(f"来源存在其他修改（未提交）：tracked 原始字节与 HEAD blob 不符：{file}")
 
 
 def verify_complete_repository(path: Path, source_root: Path | None = None,
                                gitlink_overrides: dict | None = None,
-                               revision: str | None = None) -> None:
+                               revision: str | None = None,
+                               capacity_files: dict | None = None, capacity_seen: set | None = None,
+                               capacity_patched: bool = False, capacity_stamp: str | None = None) -> None:
     git_environment()
     metadata = path / ".git"
     if metadata.is_symlink() or (metadata.is_dir() and any(
@@ -236,21 +259,16 @@ def verify_complete_repository(path: Path, source_root: Path | None = None,
         raise ValueError(f"SDK 来源未独立初始化：{path}")
     if git(path, "rev-parse", "--is-shallow-repository") != "false":
         raise ValueError(f"SDK 来源必须保有完整历史，不能使用 shallow clone：{path}")
-    for line in git(path, "config", "--list").splitlines():
-        key, _, value = line.partition("=")
+    config_keys = set(git(path, "config", "--null", "--name-only", "--list").split("\0"))
+    for key in sorted(config_keys):
         if key == "extensions.partialclone" or (
-                key.startswith("remote.") and key.endswith((".promisor", ".partialclonefilter"))):
+                key.startswith("remote.") and key.endswith(".partialclonefilter")):
+            raise ValueError(f"SDK 来源不能使用 partial clone：{path}")
+        if key.startswith("remote.") and key.endswith(".promisor") and git_boolean(path, key):
             raise ValueError(f"SDK 来源不能使用 partial clone：{path}")
     # Git resolves include, scope precedence and every accepted boolean spelling.
     # Cone only selects a mode; it does not enable sparse checkout on its own.
-    sparse = subprocess.run(
-        ["git", "-C", str(path), "config", "--bool", "--get", "core.sparseCheckout"],
-        text=True, capture_output=True, env=git_environment())
-    effective_sparse = sparse.stdout.strip()
-    if sparse.returncode not in (0, 1) or (
-            sparse.returncode == 0 and effective_sparse not in ("true", "false")):
-        raise ValueError(f"SDK 来源 sparse checkout 配置无效：{path}\n{sparse.stderr.strip()}")
-    if sparse.returncode == 0 and effective_sparse == "true":
+    if git_boolean(path, "core.sparseCheckout"):
         raise ValueError(f"SDK 来源不能使用 sparse checkout：{path}")
     revision = revision or git(path, "rev-parse", "HEAD")
     if git(path, "rev-parse", "HEAD") != revision:
@@ -262,65 +280,342 @@ def verify_complete_repository(path: Path, source_root: Path | None = None,
         raise ValueError(f"SDK 来源对象不完整：{path}\n{result.stderr.strip()}")
 
     verify_object_bytes(path)
-    if git(path, "ls-files", "--others", "--exclude-standard", "-z"):
-        raise ValueError(f"来源存在其他修改（未提交的普通 untracked 内容）：{path}")
-    verify_tracked_tree(path, source_root, gitlink_overrides or {}, revision)
+    verify_tracked_tree(path, source_root, gitlink_overrides or {}, revision,
+                        capacity_files, capacity_seen, capacity_patched, capacity_stamp)
+    others = {name for name in git(path, "ls-files", "--others", "-z").split("\0") if name}
+    if capacity_patched and capacity_stamp and path.resolve() == source_root:
+        others.discard(capacity_stamp)
+    if others:
+        raise ValueError(f"来源存在其他修改（含 ignored 的未提交 untracked 内容）：{path}")
+
+
+def git_bytes(path: Path, object_path: str) -> bytes:
+    return subprocess.run(["git", "-C", str(path), "show", object_path],
+                          check=True, capture_output=True, env=git_environment()).stdout
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def object_fields(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 存在重复字段：{key}")
+        result[key] = value
+    return result
+
+
+def decode_json(data: bytes) -> dict:
+    value = json.loads(data, object_pairs_hook=object_fields)
+    if not isinstance(value, dict):
+        raise ValueError("SDK 声明必须是 JSON object")
+    return value
+
+
+def fields(value: object, expected: set[str], name: str) -> None:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError(f"{name} 字段与正式合同不符")
+
+
+def sha(value: object, size: int, name: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(rf"[0-9a-f]{{{size}}}", value):
+        raise ValueError(f"{name} 必须锁定完整摘要或提交")
+
+
+def source_path(value: object, name: str) -> str:
+    if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_./-]+", value)
+            or value.startswith("/") or any(part in ("", ".", "..") for part in value.split("/"))
+            or str(PurePosixPath(value)) != value):
+        raise ValueError(f"{name} 必须是规范仓内相对路径")
+    return value
+
+
+def repository(entry: object, keys: set[str], name: str) -> None:
+    fields(entry, keys, name)
+    sha(entry["revision"], 40, name)
+    if not isinstance(entry["repository"], str) or not re.fullmatch(
+            r"https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9-]+\.git", entry["repository"]):
+        raise ValueError(f"{name} 必须使用明确的公开 GitHub HTTPS 源")
+
+
+def read_lock() -> dict:
+    lock = decode_json(LOCK_PATH.read_bytes())
+    fields(lock, {"schema_version", "idf", "lwip", "sdk_derivation"}, "组件 SDK 锁")
+    if type(lock["schema_version"]) is not int or lock["schema_version"] != 2:
+        raise ValueError("组件必须锁定正式 SDK 派生，不接受旧 SDK 锁")
+    repository(lock["idf"], {"repository", "revision"}, "idf")
+    repository(lock["lwip"], {"repository", "revision", "path"}, "lwip")
+    if lock["lwip"]["path"] != "components/lwip/lwip":
+        raise ValueError("lwIP 装配位置与 ESP-IDF 合同不符")
+    entry = lock["sdk_derivation"]
+    repository(entry, {"repository", "revision", "path", "sha256"}, "sdk_derivation")
+    if entry["repository"] != RECIPE_REPOSITORY or entry["path"] != "sdk-lock.json":
+        raise ValueError("SDK 派生必须来自精确保存的 ESP Base 唯一 recipe")
+    sha(entry["sha256"], 64, "sdk_derivation.sha256")
+    return lock
+
+
+def recipe_from_bytes(data: bytes, lock: dict) -> dict:
+    if digest(data) != lock["sdk_derivation"]["sha256"]:
+        raise ValueError("SDK 派生清单摘要与组件锁不符")
+    recipe = decode_json(data)
+    fields(recipe, {"schema_version", "idf", "lwip", "tlsf", "managed_patches", "derivation_stamp"},
+           "SDK 派生 recipe")
+    if type(recipe["schema_version"]) is not int or recipe["schema_version"] != 2:
+        raise ValueError("SDK 派生 recipe 版本不符")
+    if recipe["idf"] != lock["idf"] or recipe["lwip"] != lock["lwip"]:
+        raise ValueError("SDK 派生官方基线与组件锁不符")
+    fields(recipe["tlsf"], {"path", "revision"}, "tlsf")
+    sha(recipe["tlsf"]["revision"], 40, "tlsf.revision")
+    if recipe["tlsf"]["path"] != "components/heap/tlsf" or recipe["derivation_stamp"] != DERIVATION_STAMP:
+        raise ValueError("TLSF 或 SDK 派生清单装配路径不符")
+    patches = recipe["managed_patches"]
+    if not isinstance(patches, list) or len(patches) != 2:
+        raise ValueError("SDK 派生必须精确声明 IDF 与 TLSF 两份修改")
+    repositories = set()
+    resources = set()
+    for patch in patches:
+        fields(patch, {"repository", "path", "sha256", "files"}, "managed_patch")
+        name = patch["repository"]
+        if name not in ("idf", "tlsf") or name in repositories:
+            raise ValueError("SDK 派生修改仓库重复或未知")
+        repositories.add(name)
+        path = source_path(patch["path"], "managed_patch.path")
+        if path in resources:
+            raise ValueError("SDK 派生 patch 来源重复")
+        resources.add(path)
+        sha(patch["sha256"], 64, "managed_patch.sha256")
+        declarations = patch["files"]
+        if not isinstance(declarations, list) or not declarations:
+            raise ValueError("SDK 派生修改文件不得为空")
+        paths = set()
+        for item in declarations:
+            fields(item, {"path", "before_sha256", "after_sha256"}, "managed_file")
+            path = source_path(item["path"], "managed_file.path")
+            if path in paths:
+                raise ValueError("SDK 派生修改文件重复")
+            paths.add(path)
+            sha(item["before_sha256"], 64, "managed_file.before_sha256")
+            sha(item["after_sha256"], 64, "managed_file.after_sha256")
+    return recipe
+
+
+def read_source_file(path: Path, *, mode: int | None = None) -> tuple[bytes, tuple]:
+    """稳定读取小型配方输入，不跟随链接，不在 FIFO 的 open 上等待。"""
+    try:
+        before = path.lstat()
+    except FileNotFoundError as error:
+        raise ValueError(f"容量配方输入缺失：{path}") from error
+    if not stat.S_ISREG(before.st_mode) or (mode is not None and stat.S_IMODE(before.st_mode) != mode):
+        raise ValueError(f"容量配方输入必须为既定权限的普通文件：{path}")
+    if before.st_size > 65536:
+        raise ValueError(f"容量配方输入大小越界：{path}")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                                 info.st_mtime_ns, info.st_ctime_ns)
+        if identity(opened) != identity(before):
+            raise ValueError(f"容量配方输入在打开时改变：{path}")
+        content = stream.read(65537)
+        after = os.fstat(stream.fileno())
+        current = path.lstat()
+        if len(content) != before.st_size or identity(after) != identity(before) or identity(current) != identity(before):
+            raise ValueError(f"容量配方输入在读取时改变：{path}")
+    return content, identity(before)
+
+
+def regular_file(root: Path, relative: str) -> Path:
+    source_path(relative, "SDK 文件路径")
+    path = root
+    for part in relative.split("/"):
+        path = path / part
+        if path.is_symlink():
+            raise ValueError(f"SDK 输入不得是符号链接：{relative}")
+    if not path.is_file():
+        raise ValueError(f"SDK 输入必须是普通文件：{relative}")
+    return path
+
+
+def verify_tree(sdk: Path, lock: dict, recipe: dict, *, patched: bool) -> None:
+    sdk = sdk.resolve(strict=True)
+    if (git(sdk, "rev-parse", "--show-toplevel") != str(sdk)
+            or git(sdk, "rev-parse", "HEAD") != lock["idf"]["revision"]):
+        raise ValueError("ESP-IDF 独立 Git 根或提交与组件锁不符")
+    lwip_path = lock["lwip"]["path"]
+    lwip = sdk / lwip_path
+    if (git(lwip, "rev-parse", "--show-toplevel") != str(lwip.resolve())
+            or git(lwip, "rev-parse", "HEAD") != lock["lwip"]["revision"]):
+        raise ValueError("lwIP 尚未使用锁定的零窗口修正提交或未独立初始化")
+    if git(lwip, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"):
+        raise ValueError("lwIP checkout 存在未提交内容")
+    tlsf_path = recipe["tlsf"]["path"]
+    tlsf = sdk / tlsf_path
+    if (git(tlsf, "rev-parse", "--show-toplevel") != str(tlsf.resolve())
+            or git(tlsf, "rev-parse", "HEAD") != recipe["tlsf"]["revision"]):
+        raise ValueError("TLSF 独立 Git 根或官方提交与派生清单不符")
+    tlsf_entry = git(sdk, "ls-tree", lock["idf"]["revision"], "--", tlsf_path)
+    if tlsf_entry != "160000 commit " + recipe["tlsf"]["revision"] + "\t" + tlsf_path:
+        raise ValueError("TLSF 必须保持锁定 IDF 的原生 gitlink 身份")
+    capacity_files = {}
+    for declaration in recipe["managed_patches"]:
+        name = declaration["repository"]
+        for item in declaration["files"]:
+            relative = item["path"] if name == "idf" else tlsf_path + "/" + item["path"]
+            if relative in capacity_files:
+                raise ValueError("SDK 正式派生原件路径重复或越入另一来源")
+            capacity_files[relative] = {**item, "repository": name}
+    seen = set()
+    verify_complete_repository(sdk, source_root=sdk,
+                               gitlink_overrides={lwip_path: lock["lwip"]["revision"]},
+                               revision=lock["idf"]["revision"], capacity_files=capacity_files,
+                               capacity_seen=seen, capacity_patched=patched,
+                               capacity_stamp=DERIVATION_STAMP)
+    if seen != set(capacity_files):
+        raise ValueError("SDK 正式派生原件不在锁定递归 HEAD 树中")
+
+    repositories = {"idf": sdk, "tlsf": tlsf}
+    for patch in recipe["managed_patches"]:
+        name = patch["repository"]
+        repo = repositories[name]
+        if git(repo, "diff", "--cached", "--name-only"):
+            raise ValueError(f"SDK 索引存在未提交内容：{name}")
+        expected = {" M " + item["path"] for item in patch["files"]} if patched else set()
+        if name == "idf":
+            expected.add(" M " + lwip_path)
+            if patched:
+                expected.update({" M " + tlsf_path, "?? " + DERIVATION_STAMP})
+        actual = git(repo, "status", "--porcelain", "--untracked-files=normal",
+                     "--ignore-submodules=none").splitlines()
+        if len(actual) != len(set(actual)) or set(actual) != expected:
+            raise ValueError(f"SDK 存在正式派生声明之外的其他修改或缺失：{name}")
+        for item in patch["files"]:
+            original = git_bytes(repo, "HEAD:" + item["path"])
+            if digest(original) != item["before_sha256"]:
+                raise ValueError(f"SDK 官方原文摘要不符：{name}/{item['path']}")
+            current = regular_file(repo, item["path"]).read_bytes()
+            wanted = item["after_sha256"] if patched else item["before_sha256"]
+            if digest(current) != wanted:
+                raise ValueError(f"SDK 正式派生源码摘要不符：{name}/{item['path']}")
+    for line in git(sdk, "submodule", "status", "--recursive").splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            raise ValueError("SDK 子模块状态不可解析")
+        revision, path = parts[:2]
+        if revision.startswith(("-", "U")):
+            raise ValueError(f"SDK 子模块未就绪：{path}")
+        if revision.startswith("+") and (path != lwip_path or revision[1:] != lock["lwip"]["revision"]):
+            raise ValueError(f"SDK 子模块版本漂移：{path}")
+
 
 
 
 def verify(sdk: Path, lock: dict) -> None:
     sdk = sdk.resolve(strict=True)
-    lwip_path = lock["lwip"]["path"]
-    if git(sdk, "rev-parse", "HEAD") != lock["idf"]["revision"]:
-        raise ValueError("ESP-IDF 提交与 sdk-lock.json 不符")
-    lwip = sdk / lwip_path
-    if git(lwip, "rev-parse", "--show-toplevel") != str(lwip.resolve()):
-        raise ValueError("lwIP 子模块未独立初始化")
-    if git(lwip, "rev-parse", "HEAD") != lock["lwip"]["revision"]:
-        raise ValueError("lwIP 尚未使用锁定的零窗口修正提交；请准备独立 SDK")
-    verify_complete_repository(sdk, gitlink_overrides={lwip_path: lock["lwip"]["revision"]},
-                               revision=lock["idf"]["revision"])
+    stamp = regular_file(sdk, DERIVATION_STAMP)
+    data, identity = read_source_file(stamp, mode=0o400)
+    recipe = recipe_from_bytes(data, lock)
+    verify_tree(sdk, lock, recipe, patched=True)
+    if read_source_file(stamp, mode=0o400) != (data, identity):
+        raise ValueError("SDK 派生清单在来源检查期间改变")
+
+
+def fetch_recipe(destination: Path, lock: dict) -> tuple[bytes, dict, list[tuple[dict, Path]]]:
+    entry = lock["sdk_derivation"]
+    destination.mkdir()
+    git(destination, "init", "-q", "-b", "master")
+    git(destination, "remote", "add", "origin", entry["repository"])
+    git(destination, "fetch", "--no-filter", "origin", entry["revision"])
+    if git(destination, "rev-parse", "FETCH_HEAD") != entry["revision"]:
+        raise ValueError("SDK recipe 来源提交不符")
+    data = git_bytes(destination, entry["revision"] + ":" + entry["path"])
+    recipe = recipe_from_bytes(data, lock)
+    resources = []
+    for declaration in recipe["managed_patches"]:
+        content = git_bytes(destination, entry["revision"] + ":" + declaration["path"])
+        if digest(content) != declaration["sha256"]:
+            raise ValueError(f"SDK recipe patch 摘要不符：{declaration['path']}")
+        path = destination / declaration["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        resources.append((declaration, path))
+    return data, recipe, resources
+
+
+def apply_recipe(sdk: Path, lock: dict, data: bytes, recipe: dict,
+                 resources: list[tuple[dict, Path]]) -> None:
+    if recipe_from_bytes(data, lock) != recipe:
+        raise ValueError("SDK recipe 输入与已锁定清单不符")
+    if [declaration for declaration, _ in resources] != recipe["managed_patches"]:
+        raise ValueError("SDK patch 输入集合与唯一 recipe 不符")
+    verify_tree(sdk, lock, recipe, patched=False)
+    repositories = {"idf": sdk, "tlsf": sdk / recipe["tlsf"]["path"]}
+    for declaration, path in resources:
+        if digest(path.read_bytes()) != declaration["sha256"]:
+            raise ValueError("SDK patch 输入摘要不符")
+        repo = repositories[declaration["repository"]]
+        names = []
+        for line in git(repo, "apply", "--numstat", str(path)).splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                raise ValueError("SDK patch 文件集合不可解析")
+            names.append(parts[2])
+        if len(names) != len(set(names)) or set(names) != {item["path"] for item in declaration["files"]}:
+            raise ValueError("SDK patch 修改文件集合与唯一 recipe 不符")
+        git(repo, "apply", "--check", "--whitespace=nowarn", str(path))
+    for declaration, path in resources:
+        git(repositories[declaration["repository"]], "apply", "--whitespace=nowarn", str(path))
+    descriptor = os.open(sdk / DERIVATION_STAMP, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    verify(sdk, lock)
 
 
 def prepare(output: Path, lock: dict) -> None:
     output = output.expanduser().absolute()
-    if output.exists():
+    if output.exists() or output.is_symlink():
         raise ValueError("输出路径已存在；prepare 只创建新 SDK，已有 SDK 使用 check")
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.mkdir()  # Reserve ownership; no overwrite or implicit repair.
-    git(output, "init", "-q")
-    git(output, "remote", "add", "origin", lock["idf"]["repository"])
-    git(output, "fetch", "origin", lock["idf"]["revision"])
-    git(output, "checkout", "--detach", "FETCH_HEAD")
-    git(output, "submodule", "update", "--init", "--recursive", "--checkout",
-        "--no-recommend-shallow", "--jobs=8")
-    lwip = output / lock["lwip"]["path"]
-    git(lwip, "remote", "set-url", "origin", lock["lwip"]["repository"])
-    git(lwip, "fetch", "origin", lock["lwip"]["revision"])
-    git(lwip, "checkout", "--detach", "FETCH_HEAD")
-    verify(output, lock)
+    output.mkdir()
+    with tempfile.TemporaryDirectory(prefix="esp-sdk-recipe-") as temporary:
+        data, recipe, resources = fetch_recipe(Path(temporary) / "recipe", lock)
+        git(output, "init", "-q", "-b", "master")
+        git(output, "remote", "add", "origin", lock["idf"]["repository"])
+        git(output, "fetch", "--no-filter", "origin", lock["idf"]["revision"])
+        git(output, "checkout", "--detach", "FETCH_HEAD")
+        git(output, "submodule", "update", "--init", "--recursive", "--checkout", "--no-recommend-shallow", "--jobs=8")
+        lwip = output / lock["lwip"]["path"]
+        git(lwip, "remote", "set-url", "origin", lock["lwip"]["repository"])
+        git(lwip, "fetch", "--no-filter", "origin", lock["lwip"]["revision"])
+        git(lwip, "checkout", "--detach", "FETCH_HEAD")
+        apply_recipe(output, lock, data, recipe, resources)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("prepare", "check"))
-    parser.add_argument("--path", required=True, type=Path, help="新 SDK 输出路径或待检查 SDK")
-    parser.add_argument("--quiet", action="store_true", help="成功时不输出，用于构建守卫")
+    parser.add_argument("--path", required=True, type=Path)
+    parser.add_argument("--quiet", action="store_true", help="构建守卫成功时不输出")
     args = parser.parse_args()
     try:
         lock = read_lock()
         if args.action == "prepare":
             if not args.quiet:
-                print(f"ESP FRP SDK\n  操作  准备独立 checkout\n  路径  {args.path}\n", flush=True)
+                print(f"ESP SDK\n  操作  准备正式派生\n  路径  {args.path}\n", flush=True)
             prepare(args.path, lock)
         else:
             verify(args.path, lock)
         if not args.quiet:
-            print(f"ESP FRP SDK\n  结果  已验证\n  IDF   {lock['idf']['revision']}\n"
-                  f"  lwIP  {lock['lwip']['revision']}\n  路径  {args.path.resolve()}")
+            print(f"ESP SDK\n  结果  已验证正式派生\n  IDF   {lock['idf']['revision']}\n"
+                  f"  lwIP  {lock['lwip']['revision']}\n  清单  {lock['sdk_derivation']['sha256']}\n"
+                  f"  路径  {args.path.resolve()}")
         return 0
-    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
-        print(f"ESP FRP SDK\n  结果  失败\n  原因  {error}", file=sys.stderr)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"ESP SDK\n  结果  失败\n  原因  {error}", file=sys.stderr)
         return 1
 
 

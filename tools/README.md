@@ -1,30 +1,36 @@
-# SDK 准备与校验
+# SDK 准备与检查
 
-`sdk.py` 只使用本仓 [sdk-lock.json](../sdk-lock.json)、Python 标准库、Git 和公开精确提交。它创建完整独立 ESP-IDF checkout，再将其 lwIP 子模块切到锁定修正提交；不会改动已有机器 SDK，也不从相邻工作区源码构建。
-
-## 架构拓扑
+`tools/sdk.py` 只消费本仓 [sdk-lock.json](../sdk-lock.json)、Python 标准库、Git 和锁定的公开来源。组件锁保存 IDF／lwIP 身份，以及 ESP Base 唯一 recipe 的来源提交与完整摘要；TLSF、两份修改与逐文件原文／派生摘要只存在于该 recipe。组件不保存第二套 patch 清单或脚本。
 
 ```mermaid
 flowchart LR
-    lock["sdk-lock.json：IDF / lwIP 精确提交"] --> prepare["sdk.py prepare：只接受不存在的输出路径"]
-    official["官方 ESP-IDF 与其固定子模块"] --> prepare
-    fixed["公开 esp-lwip 修正提交"] --> prepare
-    prepare --> sdk["独立 SDK checkout"]
-    sdk --> check["sdk.py check：身份、唯一 gitlink 差异与子模块一致性"]
-    check --> build["IDF 组件 CMake 构建守卫"]
+    lock["组件 SDK 锁：官方身份 / recipe 提交与摘要"] --> prepare["sdk.py prepare：独立新目录"]
+    recipe["Base 精确提交：唯一 sdk-lock.json / 两份修改"] --> prepare
+    sdk["锁定 IDF / lwIP / TLSF 官方源码"] --> prepare
+    prepare --> checkout["正式 SDK / 唯一 esp-sdk-derivation.json"]
+    checkout --> check["本仓 sdk.py check：清单 / 源码 / Git 状态"]
+    check --> component["CMake 组件守卫"]
 ```
 
 ```bash
+export PYTHONDONTWRITEBYTECODE=1
 python3 tools/sdk.py prepare --path "$HOME/.espressif/frameworks/esp-frp-idf"
 bash "$HOME/.espressif/frameworks/esp-frp-idf/install.sh" esp32c3 esp32
 source "$HOME/.espressif/frameworks/esp-frp-idf/export.sh"
 python3 tools/sdk.py check --path "$IDF_PATH"
-idf.py -C examples/tcp-proxy build
+python3 -B -m unittest discover -s tools/tests -p test_sdk.py
 ```
 
-首次准备需要网络并下载官方子模块；失败时保留新目录供排障，后续不自动覆盖或修复已有路径。安装工具链与准备源码是独立动作，`prepare` 不刷写设备、创建 Secret 或发布制品。Git 可能把唯一锁定的 lwIP gitlink 显示为修改，这正是显式 SDK 装配合同；普通 `prepare` 显式忽略上游子模块的浅克隆建议，完整取得根与递归依赖；`check` 同时拒绝 shallow/partial/sparse 来源、缺失对象和文件或环境提供的外部对象库。SDK 根 Git 元数据必须位于来源自身目录；absorbed submodule 的 gitdir 仅允许位于根来源自有 Git modules 下，并以原生 core.worktree 绑定当前子目录，独立子模块可保留自身 `.git`。来源 gitdir 与 common-dir 必须一致，对象目录与对象不得借用仓外存储；符号链接、无绑定定位文件、外置 separate-git-dir 和 linked worktree 被拒绝。Git 环境不得重定向来源、索引或对象目录，replace/grafts 历史替换一律拒绝，所有 Git 读取显式禁用对象替换。每个递归来源显式检查工作树，不受 `submodule.*.ignore` 配置影响。其他修改、未初始化子模块或提交漂移一律拒绝。
+`prepare` 只创建不存在的新路径，从冻结 Base 提交读取 recipe 和两份修改的数据，不执行 Base 构建或 SDK 内脚本。它核对清单与 patch 摘要、所有官方原文及完整修改集合，在全部 `git apply --check` 通过后才应用；最后独占创建 SDK 根普通文件 `esp-sdk-derivation.json`，其字节与冻结 recipe 完全相同。工具链安装与导出仍是独立的官方入口。
 
-`check --quiet` 供构建调用；普通 host 协议测试不需要 ESP-IDF。准备检查的真实 Git fixture 回归：`python3 -m unittest discover -s tools/tests -p 'test_*.py'`。
+`check` 只读本地 SDK：先核该普通文件的完整摘要，再核官方 IDF／lwIP／TLSF 提交、逐文件原文与派生摘要、索引、精确工作树差异及所有子模块；不下载、不执行未知脚本，不调用相邻仓库。未装配旧 SDK、清单缺失／链接／漂移、部分修改、未声明修改及子模块漂移均拒绝。既有路径和失败现场保持，不提供自动修复、可选 allowlist 或旧门回退。`--quiet` 供构建调用，仅省略成功输出。
+
+真实 Git fixture 覆盖独立准备、精确来源与逐文件校验，以及原始 lwIP、脏状态、索引、TLSF、清单、链接、部分修改和越界路径等拒绝；它不下载真实 SDK、不触达设备。软件守卫通过不授予 FRP／Base 组合容量、Broker 或实板资格。
+
+
+来源检查使用完整原生 Git 对象、HEAD 原始树、索引，以及实际源码字节、类型、执行位和符号链接目标；逐个递归来源拒绝 shallow／partial／sparse、缺失或被改写对象、借用对象库、外置或无绑定元数据、replace／grafts、Git 来源环境重定向，以及包括 ignored 在内的所有未跟踪内容。absorbed 子模块只接受根来源自身的 Git modules 与原生 core.worktree 绑定；独立子模块保留自身 `.git`。sparse／promisor 按 Git 作用域、include 和原生布尔语义核对最终有效值，完整来源允许有效的 false，partial clone filter 标记仍拒绝。`prepare` 完整取得根与递归精确 gitlink，不使用 shallow 获取；唯一 stamp 为 `0400` 的普通文件，其内容与冻结 recipe 逐字相同。
+
+从 SDK 安装与导出前设置 `PYTHONDONTWRITEBYTECODE=1`，后续 `idf.py`、CMake 和独立 Ninja／`cmake --build` 保留该环境，避免 SDK 来源出现 Python 缓存；来源检查仍拒绝所有 ignored 内容。真实临时 Git 回归同时核对 schema2 派生与这些严格来源边界，不下载真实 SDK，不授予固件、Broker、双板容量或实板资格。
 
 ## QUIC 精确源码
 
